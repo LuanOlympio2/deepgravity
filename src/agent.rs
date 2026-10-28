@@ -86,7 +86,7 @@ impl Agent {
                 std::io::Write::flush(&mut std::io::stdout())?;
             }
 
-            let messages_to_send = prune_messages_for_request(&self.messages, 140_000);
+            let messages_to_send = prune_messages_for_request(&self.messages, 90_000);
             let response = match self
                 .client
                 .chat_completion(&messages_to_send, Some(tool_definitions.clone()))
@@ -102,14 +102,42 @@ impl Agent {
                     resp
                 }
                 Err(err) => {
-                    if let Some(tx) = &self.event_tx {
-                        let _ = tx.send(AgentEvent::Thinking(false)).await;
-                        let _ = tx.send(AgentEvent::Error(err.to_string())).await;
+                    let err_msg = err.to_string();
+                    if err_msg.contains("exceeds maximum size") || err_msg.contains("Prompt exceeds") {
+                        eprintln!("⚠️ Limite de prompt atingido: executando poda de emergência e tentando novamente...");
+                        // Poda de emergência mantendo histórico essencial recente
+                        let emergency_messages = prune_messages_for_request(&self.messages, 35_000);
+                        match self.client.chat_completion(&emergency_messages, Some(tool_definitions.clone())).await {
+                            Ok(resp) => {
+                                if let Some(tx) = &self.event_tx {
+                                    let _ = tx.send(AgentEvent::Thinking(false)).await;
+                                } else {
+                                    print!("\r{}\r", " ".repeat(40));
+                                    std::io::Write::flush(&mut std::io::stdout())?;
+                                }
+                                resp
+                            }
+                            Err(retry_err) => {
+                                if let Some(tx) = &self.event_tx {
+                                    let _ = tx.send(AgentEvent::Thinking(false)).await;
+                                    let _ = tx.send(AgentEvent::Error(retry_err.to_string())).await;
+                                } else {
+                                    print!("\r{}\r", " ".repeat(40));
+                                    std::io::Write::flush(&mut std::io::stdout())?;
+                                }
+                                return Err(retry_err);
+                            }
+                        }
                     } else {
-                        print!("\r{}\r", " ".repeat(40));
-                        std::io::Write::flush(&mut std::io::stdout())?;
+                        if let Some(tx) = &self.event_tx {
+                            let _ = tx.send(AgentEvent::Thinking(false)).await;
+                            let _ = tx.send(AgentEvent::Error(err.to_string())).await;
+                        } else {
+                            print!("\r{}\r", " ".repeat(40));
+                            std::io::Write::flush(&mut std::io::stdout())?;
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
                 }
             };
 
@@ -184,9 +212,9 @@ impl Agent {
                             print_tool_result(&call.function.name, success, &summary);
                         }
 
-                        let stored_content = if result_str.len() > 18_000 {
-                            let head: String = result_str.chars().take(12_000).collect();
-                            let tail: String = result_str.chars().rev().take(4_000).collect::<String>().chars().rev().collect();
+                        let stored_content = if result_str.len() > 6_000 {
+                            let head: String = result_str.chars().take(4_000).collect();
+                            let tail: String = result_str.chars().rev().take(1_500).collect::<String>().chars().rev().collect();
                             format!("{}\n\n[... resultado truncado pelo DeepGravity (total: {} bytes) ...]\n\n{}", head, result_str.len(), tail)
                         } else {
                             result_str
@@ -279,16 +307,18 @@ fn extract_fallback_tool_calls(text: &str) -> Option<Vec<crate::client::ToolCall
     None
 }
 
+fn message_exact_size(m: &Message) -> usize {
+    serde_json::to_string(m).map_or(0, |s| s.len() + 2)
+}
+
 /// Limita o tamanho do histórico enviado à API para não ultrapassar limites de prompt (ex: 200k chars no gateway).
-/// Preserva a mensagem de sistema e as mensagens mais recentes.
+/// Calcula o tamanho JSON real serializado (incluindo tool_calls/arguments), preserva a mensagem de sistema,
+/// o primeiro comando do usuário e os turnos mais recentes em pares íntegros.
 fn prune_messages_for_request(messages: &[Message], max_chars: usize) -> Vec<Message> {
     if messages.is_empty() {
         return Vec::new();
     }
-    let total_chars: usize = messages
-        .iter()
-        .map(|m| m.content.as_ref().map_or(0, |c| c.len()))
-        .sum();
+    let total_chars: usize = messages.iter().map(message_exact_size).sum();
     if total_chars <= max_chars {
         return messages.to_vec();
     }
@@ -297,19 +327,43 @@ fn prune_messages_for_request(messages: &[Message], max_chars: usize) -> Vec<Mes
     let system_msg = if has_system { Some(messages[0].clone()) } else { None };
     let non_system = if has_system { &messages[1..] } else { messages };
 
-    let mut budget = max_chars.saturating_sub(
-        system_msg
-            .as_ref()
-            .and_then(|m| m.content.as_ref())
-            .map_or(0, |c| c.len()),
-    );
+    // Tenta preservar também o primeiro comando do usuário
+    let first_user_msg = non_system.first().and_then(|m| {
+        if m.role == "user" {
+            Some(m.clone())
+        } else {
+            None
+        }
+    });
+
+    let fixed_cost = system_msg.as_ref().map_or(0, message_exact_size)
+        + first_user_msg.as_ref().map_or(0, message_exact_size);
+
+    let mut budget = max_chars.saturating_sub(fixed_cost);
     let mut kept_rev = Vec::new();
 
-    for msg in non_system.iter().rev() {
-        let msg_len = msg.content.as_ref().map_or(0, |c| c.len());
+    let candidate_slice = if first_user_msg.is_some() && non_system.len() > 1 {
+        &non_system[1..]
+    } else {
+        non_system
+    };
+
+    for msg in candidate_slice.iter().rev() {
+        let msg_len = message_exact_size(msg);
         if msg_len <= budget || kept_rev.is_empty() {
             budget = budget.saturating_sub(msg_len);
             kept_rev.push(msg.clone());
+        } else {
+            break;
+        }
+    }
+
+    // Se o primeiro item mantido nos recentes for uma resposta de ferramenta órfã,
+    // descartamos até encontrar uma mensagem válida (evita erro de protocolo)
+    let mut kept: Vec<Message> = kept_rev.into_iter().rev().collect();
+    while let Some(first) = kept.first() {
+        if first.role == "tool" {
+            kept.remove(0);
         } else {
             break;
         }
@@ -319,6 +373,18 @@ fn prune_messages_for_request(messages: &[Message], max_chars: usize) -> Vec<Mes
     if let Some(sys) = system_msg {
         out.push(sys);
     }
-    out.extend(kept_rev.into_iter().rev());
+    if let Some(usr) = first_user_msg {
+        out.push(usr);
+    }
+    if kept.len() < candidate_slice.len() {
+        out.push(Message {
+            role: "user".to_string(),
+            content: Some("[DeepGravity: Histórico intermediário anterior compactado para manter limite de contexto. Prossiga com foco nos passos recentes.]".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+    }
+    out.extend(kept);
     out
 }
